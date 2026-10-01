@@ -244,26 +244,77 @@ class TextGenerator(Protocol):
 
 class OpenAIGenerator:
     def __init__(self, max_output_tokens: int = 300) -> None:
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
-        self.model = os.getenv("OPENAI_MODEL", "").strip()
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY is missing from .env")
+        api_key = (
+            os.getenv("GEMINI_API_KEY", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+        )
+        self.model = (
+            os.getenv("GEMINI_MODEL", "").strip()
+            or os.getenv("OPENAI_MODEL", "").strip()
+        )
+        base_url = (
+            os.getenv("OPENAI_BASE_URL", "").strip()
+            or os.getenv("GEMINI_BASE_URL", "").strip()
+        )
+
+        is_gemini = (
+            bool(os.getenv("GEMINI_API_KEY"))
+            or (self.model and "gemini" in self.model.lower())
+            or api_key.startswith("AIzaSy")
+            or ("googleapis.com" in base_url)
+        )
+        if is_gemini and not base_url:
+            base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+            if not self.model:
+                self.model = "gemini-2.5-flash"
+
+        if not api_key or api_key == "your_openai_api_key_here":
+            raise RuntimeError("API key (OPENAI_API_KEY or GEMINI_API_KEY) is missing from .env")
         if not self.model:
-            raise RuntimeError("OPENAI_MODEL is missing from .env")
-        self.client = OpenAI(api_key=api_key)
+            raise RuntimeError("Model (OPENAI_MODEL or GEMINI_MODEL) is missing from .env")
+
+        client_kwargs: dict[str, Any] = {"api_key": api_key}
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        self.client = OpenAI(**client_kwargs)
         self.max_output_tokens = max_output_tokens
+        self.is_gemini = is_gemini
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise RuntimeError("OpenAI returned an empty answer")
-        return answer
+        for attempt in range(5):
+            try:
+                if not self.is_gemini and hasattr(self.client, "responses"):
+                    try:
+                        response = self.client.responses.create(
+                            model=self.model,
+                            input=prompt,
+                            temperature=0,
+                            max_output_tokens=self.max_output_tokens,
+                        )
+                        answer = response.output_text.strip()
+                        if answer:
+                            return answer
+                    except Exception:
+                        pass
+
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=self.max_output_tokens,
+                )
+                answer = (response.choices[0].message.content or "").strip()
+                if not answer:
+                    raise RuntimeError("Generator returned an empty answer")
+                return answer
+            except Exception as exc:
+                err_msg = str(exc)
+                if ("429" in err_msg or "quota" in err_msg.lower() or "exhausted" in err_msg.lower()) and attempt < 4:
+                    wait_time = 25 * (attempt + 1)
+                    print(f"\n[Rate Limit 429] Hit quota limit. Waiting {wait_time}s before retrying...", flush=True)
+                    time.sleep(wait_time)
+                    continue
+                raise
 
 
 @dataclass(frozen=True)
@@ -451,6 +502,7 @@ def generate_actual_answers(
             f"[{bar_after}] {index:02d}/{total:02d} | {item['id']} OK "
             f"({elapsed:.1f}s, {len(response.retrieved_chunks)} chunks)"
         )
+        time.sleep(2)
 
     return {
         "schema_version": "1.0",
